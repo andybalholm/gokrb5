@@ -93,7 +93,8 @@ func (c *Client) Do(req *http.Request) (resp *http.Response, err error) {
 		if ue, ok := err.(*url.Error); ok {
 			if e, ok := ue.Err.(redirectErr); ok {
 				// Picked up a redirect
-				e.reqTarget.Header.Del(HTTPHeaderAuthRequest)
+				e.reqTarget.Header.Del(httpAuth.requestHeader)
+				e.reqTarget.Header.Del(proxyAuth.requestHeader)
 				c.reqs = append(c.reqs, e.reqTarget)
 				if len(c.reqs) >= 10 {
 					return resp, errors.New("stopped after 10 redirects")
@@ -108,7 +109,11 @@ func (c *Client) Do(req *http.Request) (resp *http.Response, err error) {
 		return resp, err
 	}
 	if respUnauthorizedNegotiate(resp) {
-		err := SetSPNEGOHeader(c.krb5Client, req, c.spn)
+		mode := httpAuth
+		if resp.StatusCode == proxyAuth.statusCode {
+			mode = proxyAuth
+		}
+		err := setSPNEGOHeader(c.krb5Client, req, c.spn, mode)
 		if err != nil {
 			return resp, err
 		}
@@ -155,8 +160,13 @@ func (c *Client) Head(url string) (resp *http.Response, err error) {
 }
 
 func respUnauthorizedNegotiate(resp *http.Response) bool {
-	if resp.StatusCode == http.StatusUnauthorized {
-		if resp.Header.Get(HTTPHeaderAuthResponse) == HTTPHeaderAuthResponseValueKey {
+	if resp.StatusCode == httpAuth.statusCode {
+		if resp.Header.Get(httpAuth.responseHeader) == HTTPHeaderAuthResponseValueKey {
+			return true
+		}
+	}
+	if resp.StatusCode == proxyAuth.statusCode {
+		if resp.Header.Get(proxyAuth.responseHeader) == HTTPHeaderAuthResponseValueKey {
 			return true
 		}
 	}
@@ -194,6 +204,10 @@ func setRequestSPN(r *http.Request) (types.PrincipalName, error) {
 // SetSPNEGOHeader gets the service ticket and sets it as the SPNEGO authorization header on HTTP request object.
 // To auto generate the SPN from the request object pass a null string "".
 func SetSPNEGOHeader(cl *client.Client, r *http.Request, spn string) error {
+	return setSPNEGOHeader(cl, r, spn, httpAuth)
+}
+
+func setSPNEGOHeader(cl *client.Client, r *http.Request, spn string, mode authMode) error {
 	if spn == "" {
 		pn, err := setRequestSPN(r)
 		if err != nil {
@@ -216,7 +230,7 @@ func SetSPNEGOHeader(cl *client.Client, r *http.Request, spn string) error {
 		return krberror.Errorf(err, krberror.EncodingError, "could not marshal SPNEGO")
 	}
 	hs := "Negotiate " + base64.StdEncoding.EncodeToString(nb)
-	r.Header.Set(HTTPHeaderAuthRequest, hs)
+	r.Header.Set(mode.requestHeader, hs)
 	return nil
 }
 
@@ -243,8 +257,36 @@ const (
 	UnauthorizedMsg = "Unauthorised.\n"
 )
 
+// An authMode specifies the header names and status codes used.
+type authMode struct {
+	requestHeader  string
+	responseHeader string
+	statusCode     int
+}
+
+var httpAuth = authMode{
+	requestHeader:  "Authorization",
+	responseHeader: "WWW-Authenticate",
+	statusCode:     http.StatusUnauthorized,
+}
+
+var proxyAuth = authMode{
+	requestHeader:  "Proxy-Authorization",
+	responseHeader: "Proxy-Authenticate",
+	statusCode:     http.StatusProxyAuthRequired,
+}
+
 // SPNEGOKRB5Authenticate is a Kerberos SPNEGO authentication HTTP handler wrapper.
 func SPNEGOKRB5Authenticate(inner http.Handler, kt *keytab.Keytab, settings ...func(*service.Settings)) http.Handler {
+	return authenticate(inner, kt, settings, httpAuth)
+}
+
+// SPNEGOKRB5ProxyAuthenticate is a Kerberos SPNEGO proxy authentication HTTP handler wrapper.
+func SPNEGOKRB5ProxyAuthenticate(inner http.Handler, kt *keytab.Keytab, settings ...func(*service.Settings)) http.Handler {
+	return authenticate(inner, kt, settings, proxyAuth)
+}
+
+func authenticate(inner http.Handler, kt *keytab.Keytab, settings []func(*service.Settings), mode authMode) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Set up the SPNEGO GSS-API mechanism
 		var spnego *SPNEGO
@@ -267,7 +309,7 @@ func SPNEGOKRB5Authenticate(inner http.Handler, kt *keytab.Keytab, settings ...f
 			return
 		}
 
-		st, err := getAuthorizationNegotiationHeaderAsSPNEGOToken(spnego, r, w)
+		st, err := getAuthorizationNegotiationHeaderAsSPNEGOToken(spnego, r, w, mode)
 		if st == nil || err != nil {
 			// response to client and logging handled in function above so just return
 			return
@@ -276,11 +318,11 @@ func SPNEGOKRB5Authenticate(inner http.Handler, kt *keytab.Keytab, settings ...f
 		// Validate the context token
 		authed, ctx, status := spnego.AcceptSecContext(st)
 		if status.Code != gssapi.StatusComplete && status.Code != gssapi.StatusContinueNeeded {
-			spnegoResponseReject(spnego, w, "%s - SPNEGO validation error: %v", r.RemoteAddr, status)
+			spnegoResponseReject(spnego, w, mode, "%s - SPNEGO validation error: %v", r.RemoteAddr, status)
 			return
 		}
 		if status.Code == gssapi.StatusContinueNeeded {
-			spnegoNegotiateKRB5MechType(spnego, w, "%s - SPNEGO GSS-API continue needed", r.RemoteAddr)
+			spnegoNegotiateKRB5MechType(spnego, w, mode, "%s - SPNEGO GSS-API continue needed", r.RemoteAddr)
 			return
 		}
 
@@ -292,23 +334,23 @@ func SPNEGOKRB5Authenticate(inner http.Handler, kt *keytab.Keytab, settings ...f
 			if err != nil {
 				return
 			}
-			spnegoResponseAcceptCompleted(spnego, w, "%s %s@%s - SPNEGO authentication succeeded", r.RemoteAddr, id.UserName(), id.Domain())
+			spnegoResponseAcceptCompleted(spnego, w, mode, "%s %s@%s - SPNEGO authentication succeeded", r.RemoteAddr, id.UserName(), id.Domain())
 			// Add the identity to the context and serve the inner/wrapped handler
 			inner.ServeHTTP(w, goidentity.AddToHTTPRequestContext(id, r))
 			return
 		}
 		// If we get to here we have not authenticationed so just reject
-		spnegoResponseReject(spnego, w, "%s - SPNEGO Kerberos authentication failed", r.RemoteAddr)
+		spnegoResponseReject(spnego, w, mode, "%s - SPNEGO Kerberos authentication failed", r.RemoteAddr)
 		return
 	})
 }
 
-func getAuthorizationNegotiationHeaderAsSPNEGOToken(spnego *SPNEGO, r *http.Request, w http.ResponseWriter) (*SPNEGOToken, error) {
-	s := strings.SplitN(r.Header.Get(HTTPHeaderAuthRequest), " ", 2)
+func getAuthorizationNegotiationHeaderAsSPNEGOToken(spnego *SPNEGO, r *http.Request, w http.ResponseWriter, mode authMode) (*SPNEGOToken, error) {
+	s := strings.SplitN(r.Header.Get(mode.requestHeader), " ", 2)
 	if len(s) != 2 || s[0] != HTTPHeaderAuthResponseValueKey {
 		// No Authorization header set so return 401 with WWW-Authenticate Negotiate header
-		w.Header().Set(HTTPHeaderAuthResponse, HTTPHeaderAuthResponseValueKey)
-		http.Error(w, UnauthorizedMsg, http.StatusUnauthorized)
+		w.Header().Set(mode.responseHeader, HTTPHeaderAuthResponseValueKey)
+		http.Error(w, UnauthorizedMsg, mode.statusCode)
 		return nil, errors.New("client did not provide a negotiation authorization header")
 	}
 
@@ -316,7 +358,7 @@ func getAuthorizationNegotiationHeaderAsSPNEGOToken(spnego *SPNEGO, r *http.Requ
 	b, err := base64.StdEncoding.DecodeString(s[1])
 	if err != nil {
 		err = fmt.Errorf("error in base64 decoding negotiation header: %v", err)
-		spnegoNegotiateKRB5MechType(spnego, w, "%s - SPNEGO %v", r.RemoteAddr, err)
+		spnegoNegotiateKRB5MechType(spnego, w, mode, "%s - SPNEGO %v", r.RemoteAddr, err)
 		return nil, err
 	}
 	var st SPNEGOToken
@@ -326,7 +368,7 @@ func getAuthorizationNegotiationHeaderAsSPNEGOToken(spnego *SPNEGO, r *http.Requ
 		var k5t KRB5Token
 		if k5t.Unmarshal(b) != nil {
 			err = fmt.Errorf("error in unmarshaling SPNEGO token: %v", err)
-			spnegoNegotiateKRB5MechType(spnego, w, "%s - SPNEGO %v", r.RemoteAddr, err)
+			spnegoNegotiateKRB5MechType(spnego, w, mode, "%s - SPNEGO %v", r.RemoteAddr, err)
 			return nil, err
 		}
 		// Wrap it into an SPNEGO context token
@@ -376,21 +418,21 @@ func newSession(spnego *SPNEGO, r *http.Request, w http.ResponseWriter, id *cred
 
 // Log and respond to client for error conditions
 
-func spnegoNegotiateKRB5MechType(s *SPNEGO, w http.ResponseWriter, format string, v ...interface{}) {
+func spnegoNegotiateKRB5MechType(s *SPNEGO, w http.ResponseWriter, mode authMode, format string, v ...interface{}) {
 	s.Log(format, v...)
-	w.Header().Set(HTTPHeaderAuthResponse, spnegoNegTokenRespIncompleteKRB5)
-	http.Error(w, UnauthorizedMsg, http.StatusUnauthorized)
+	w.Header().Set(mode.responseHeader, spnegoNegTokenRespIncompleteKRB5)
+	http.Error(w, UnauthorizedMsg, mode.statusCode)
 }
 
-func spnegoResponseReject(s *SPNEGO, w http.ResponseWriter, format string, v ...interface{}) {
+func spnegoResponseReject(s *SPNEGO, w http.ResponseWriter, mode authMode, format string, v ...interface{}) {
 	s.Log(format, v...)
-	w.Header().Set(HTTPHeaderAuthResponse, spnegoNegTokenRespReject)
-	http.Error(w, UnauthorizedMsg, http.StatusUnauthorized)
+	w.Header().Set(mode.responseHeader, spnegoNegTokenRespReject)
+	http.Error(w, UnauthorizedMsg, mode.statusCode)
 }
 
-func spnegoResponseAcceptCompleted(s *SPNEGO, w http.ResponseWriter, format string, v ...interface{}) {
+func spnegoResponseAcceptCompleted(s *SPNEGO, w http.ResponseWriter, mode authMode, format string, v ...interface{}) {
 	s.Log(format, v...)
-	w.Header().Set(HTTPHeaderAuthResponse, spnegoNegTokenRespKRBAcceptCompleted)
+	w.Header().Set(mode.responseHeader, spnegoNegTokenRespKRBAcceptCompleted)
 }
 
 func spnegoInternalServerError(s *SPNEGO, w http.ResponseWriter, format string, v ...interface{}) {
